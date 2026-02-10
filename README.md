@@ -33,6 +33,8 @@ TccMicroservices/
 │   └── Tcc.ApiGateway/                   # API Gateway com BenchmarkController
 │       ├── Controllers/
 │       │   └── BenchmarkController.cs
+│       ├── Services/
+│       │   └── RabbitMqProducer.cs       # Singleton producer (connection + channel reuse)
 │       ├── Dockerfile
 │       ├── Program.cs
 │       └── Tcc.ApiGateway.csproj

@@ -1,5 +1,6 @@
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
+using Tcc.ApiGateway.Services;
 using Tcc.Shared.Protos;
 
 AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
@@ -47,13 +48,8 @@ builder.Services.AddSingleton(_ =>
     return new OrderProcessing.OrderProcessingClient(channel);
 });
 
-// RabbitMQ connection as singleton
-builder.Services.AddSingleton<RabbitMQ.Client.IConnection>(_ =>
-{
-    var host = builder.Configuration["RabbitMq:Host"] ?? "localhost";
-    var factory = new RabbitMQ.Client.ConnectionFactory { HostName = host };
-    return factory.CreateConnection();
-});
+// RabbitMQ singleton producer (single connection + channel, thread-safe via lock)
+builder.Services.AddSingleton<RabbitMqProducer>();
 
 var app = builder.Build();
 

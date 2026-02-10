@@ -43,6 +43,14 @@ A ideia e medir **latencia**, **throughput** e **comportamento sob carga** de ca
 
 Comparar os tres permite avaliar trade-offs reais entre **simplicidade** (REST), **performance** (gRPC) e **desacoplamento** (RabbitMQ).
 
+### Por que um payload de 2KB?
+
+Cada requisicao inclui um campo `DataBlob` de 2048 caracteres. Isso e intencional:
+
+- Com payloads muito pequenos (~100 bytes), a diferenca entre JSON e Protobuf e insignificante — o overhead de rede/HTTP domina
+- Com **2KB**, a **serializacao** passa a ser um fator relevante, permitindo que o Protobuf (binario) demonstre sua vantagem sobre JSON (texto)
+- 2KB e realista — representa o tamanho tipico de um DTO de dominio em producao (order com items, enderecos, metadados)
+
 ---
 
 ## 2. Arquitetura Geral
@@ -176,6 +184,7 @@ message OrderRequestMessage {
   string id = 1;
   string customer_id = 2;
   double value = 3;
+  string data_blob = 4;    // payload 2KB para estressar serializacao
 }
 ```
 
@@ -213,12 +222,14 @@ API Gateway                 RabbitMQ              Processing Service
 
 **Como funciona no codigo:**
 
-- O **API Gateway** publica uma mensagem JSON na fila `orders-queue` via `BasicPublish`
+- O **API Gateway** usa um `RabbitMqProducer` singleton que mantem uma unica conexao + canal abertos durante toda a vida da aplicacao. O `Publish()` usa `lock` para garantir thread-safety (IModel nao e thread-safe)
 - Retorna **202 Accepted** imediatamente (nao espera o processamento)
 - O **Processing Service** roda um `BackgroundService` (`RabbitMqConsumerService`) que:
   - Conecta ao RabbitMQ com retry automatico
   - Consome mensagens da fila com `EventingBasicConsumer`
   - Processa cada mensagem e envia `BasicAck` (confirmacao manual)
+
+> **Por que Singleton?** A versao anterior abria um canal (`CreateModel()`) por request, o que causava crash sob carga alta. Canais sao recursos caros — a boa pratica e reutilizar um unico canal com sincronizacao.
 
 **Vantagens:**
 - Desacoplamento total — produtor e consumidor nao precisam estar online ao mesmo tempo
@@ -269,6 +280,8 @@ TccMicroservices/
 │   └── Tcc.ApiGateway/                      # API Gateway (ponto de entrada)
 │       ├── Controllers/
 │       │   └── BenchmarkController.cs       # 3 endpoints: /rest, /grpc, /rabbitmq
+│       ├── Services/
+│       │   └── RabbitMqProducer.cs          # Singleton producer (connection + channel reuse)
 │       ├── Program.cs                       # Configura DI, Swagger, OpenTelemetry
 │       ├── Dockerfile                       # Build multi-stage .NET 8
 │       └── Tcc.ApiGateway.csproj
@@ -286,13 +299,14 @@ TccMicroservices/
 
 | Arquivo | Responsabilidade |
 |---------|-----------------|
-| `OrderRequest.cs` | Define o DTO (Data Transfer Object) como um `record` imutavel: `OrderRequest(Guid Id, string CustomerId, decimal Value)` |
+| `OrderRequest.cs` | Define o DTO (Data Transfer Object) como um `record` imutavel: `OrderRequest(Guid Id, string CustomerId, decimal Value, string DataBlob)` — o `DataBlob` carrega um payload de 2KB para estressar a serializacao |
 | `order.proto` | Define o contrato gRPC em linguagem neutra. O build do .NET gera automaticamente as classes `OrderProcessingClient` e `OrderProcessingBase` |
 | `GrpcOrderService.cs` | Implementa o server gRPC. Herda de `OrderProcessingBase` (classe gerada) e implementa o metodo `SubmitOrder` |
 | `RabbitMqConsumerService.cs` | Background service que roda continuamente consumindo mensagens da fila `orders-queue`. Usa retry loop para conexao e `BasicAck` manual |
 | `ProcessingService/Program.cs` | Configura o Kestrel com duas portas (8080 para REST, 50051 para gRPC), registra o gRPC e o consumer RabbitMQ, configura OpenTelemetry |
-| `BenchmarkController.cs` | Controller com 3 actions: `POST /rest` (HttpClient), `POST /grpc` (gRPC client), `POST /rabbitmq` (BasicPublish) |
-| `ApiGateway/Program.cs` | Configura Swagger, HttpClient factory, gRPC client singleton, conexao RabbitMQ singleton, OpenTelemetry |
+| `RabbitMqProducer.cs` | Singleton que mantem uma unica conexao + canal RabbitMQ. Usa `lock` para thread-safety. Evita o crash de abrir canal por request |
+| `BenchmarkController.cs` | Controller com 3 actions: `POST /rest` (HttpClient), `POST /grpc` (gRPC client), `POST /rabbitmq` (RabbitMqProducer). Todos enviam payload de 2KB |
+| `ApiGateway/Program.cs` | Configura Swagger, HttpClient factory, gRPC client singleton, RabbitMqProducer singleton, OpenTelemetry |
 | `docker-compose.yml` | Define e orquestra 5 servicos: RabbitMQ, Jaeger, ProcessingService, ApiGateway, JMeter |
 | `tcc_benchmark.jmx` | Plano JMeter com 3 Thread Groups sequenciais (REST, gRPC, RabbitMQ), cada um com N threads por D segundos |
 | `run_benchmark.ps1` / `.sh` | Scripts que automatizam: limpeza, build, health check, execucao do JMeter, abertura do relatorio |
@@ -423,8 +437,8 @@ A imagem final contem **apenas** o runtime + binarios publicados, sem SDK, fonte
 ```
 1. JMeter → POST http://api-gateway:5000/api/benchmark/rest
 2. BenchmarkController.Rest() é chamado
-3. Cria um OrderRequest com GUID aleatorio
-4. Serializa para JSON: {"Id":"...","CustomerId":"customer-1","Value":99.99}
+3. Cria um OrderRequest com GUID aleatorio + payload 2KB
+4. Serializa para JSON (~2.3KB com overhead do texto base)
 5. HttpClient faz POST http://processing-service:8080/api/orders
 6. ProcessingService recebe via Minimal API (MapPost)
 7. Simula processamento (Task.Delay 10ms)
@@ -434,10 +448,12 @@ A imagem final contem **apenas** o runtime + binarios publicados, sem SDK, fonte
 
 **Codigo relevante — ApiGateway (quem chama):**
 ```csharp
+private static readonly string Payload2KB = new('A', 2048);
+
 [HttpPost("rest")]
 public async Task<IActionResult> Rest()
 {
-    var order = new OrderRequest(Guid.NewGuid(), "customer-1", 99.99m);
+    var order = new OrderRequest(Guid.NewGuid(), "customer-1", 99.99m, Payload2KB);
     var client = httpClientFactory.CreateClient("ProcessingService");
     var json = JsonSerializer.Serialize(order);
     var content = new StringContent(json, Encoding.UTF8, "application/json");
@@ -462,8 +478,8 @@ app.MapPost("/api/orders", async (OrderRequest order) =>
 ```
 1. JMeter → POST http://api-gateway:5000/api/benchmark/grpc
 2. BenchmarkController.Grpc() é chamado
-3. Chama grpcClient.SubmitOrderAsync() com OrderRequestMessage (Protobuf)
-4. Dados sao serializados em binario e enviados via HTTP/2
+3. Chama grpcClient.SubmitOrderAsync() com OrderRequestMessage + payload 2KB (Protobuf)
+4. Dados sao serializados em binario (~2KB compactos) e enviados via HTTP/2
 5. GrpcOrderService.SubmitOrder() recebe no ProcessingService
 6. Simula processamento (Task.Delay 10ms)
 7. Retorna OrderReplyMessage (Protobuf binario)
@@ -479,7 +495,8 @@ public async Task<IActionResult> Grpc()
     {
         Id = Guid.NewGuid().ToString(),
         CustomerId = "customer-1",
-        Value = 99.99
+        Value = 99.99,
+        DataBlob = Payload2KB  // 2KB payload — Protobuf serializa mais eficientemente que JSON
     });
     return Ok(new { reply.Success, reply.Message });
 }
@@ -507,8 +524,8 @@ public class GrpcOrderService : OrderProcessing.OrderProcessingBase
 ```
 1. JMeter → POST http://api-gateway:5000/api/benchmark/rabbitmq
 2. BenchmarkController.RabbitMq() é chamado
-3. Serializa OrderRequest para JSON bytes
-4. Publica na fila "orders-queue" via BasicPublish
+3. Cria OrderRequest com payload 2KB
+4. RabbitMqProducer.Publish() serializa e publica via canal singleton (com lock)
 5. Retorna 202 Accepted IMEDIATAMENTE (sem esperar processamento)
 6. [Assincrono] RabbitMQ entrega a mensagem ao Consumer
 7. RabbitMqConsumerService recebe via EventingBasicConsumer
@@ -516,18 +533,41 @@ public class GrpcOrderService : OrderProcessing.OrderProcessingBase
 9. Envia BasicAck confirmando o processamento
 ```
 
-**Codigo relevante — ApiGateway (produtor):**
+**Codigo relevante — RabbitMqProducer (singleton):**
+```csharp
+public class RabbitMqProducer : IDisposable
+{
+    private readonly IConnection _connection;
+    private readonly IModel _channel;
+    private readonly object _lock = new();
+
+    public RabbitMqProducer(IConfiguration configuration)
+    {
+        var host = configuration["RabbitMq:Host"] ?? "localhost";
+        _connection = new ConnectionFactory { HostName = host }.CreateConnection();
+        _channel = _connection.CreateModel();
+        _channel.QueueDeclare("orders-queue", durable: false, exclusive: false, autoDelete: false);
+    }
+
+    public void Publish(OrderRequest order)
+    {
+        var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(order));
+        lock (_lock)  // IModel nao e thread-safe
+        {
+            _channel.BasicPublish(exchange: "", routingKey: "orders-queue",
+                                  basicProperties: null, body: body);
+        }
+    }
+}
+```
+
+**Codigo relevante — BenchmarkController (produtor):**
 ```csharp
 [HttpPost("rabbitmq")]
 public IActionResult RabbitMq()
 {
-    var order = new OrderRequest(Guid.NewGuid(), "customer-1", 99.99m);
-    using var channel = rabbitConnection.CreateModel();
-    channel.QueueDeclare(queue: "orders-queue", durable: false,
-                         exclusive: false, autoDelete: false);
-    var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(order));
-    channel.BasicPublish(exchange: "", routingKey: "orders-queue",
-                         basicProperties: null, body: body);
+    var order = new OrderRequest(Guid.NewGuid(), "customer-1", 99.99m, Payload2KB);
+    rabbitProducer.Publish(order);
     return Accepted(new { Success = true, Message = $"Order {order.Id} published to queue" });
 }
 ```

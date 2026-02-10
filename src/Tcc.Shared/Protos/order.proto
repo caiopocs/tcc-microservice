@@ -12,6 +12,7 @@ message OrderRequestMessage {
   string id = 1;
   string customer_id = 2;
   double value = 3;
+  string data_blob = 4;
 }
 
 message OrderReplyMessage {
