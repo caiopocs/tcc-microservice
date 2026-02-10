@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+option csharp_namespace = "Tcc.Shared.Protos";
+
+package orders;
+
+service OrderProcessing {
+  rpc SubmitOrder (OrderRequestMessage) returns (OrderReplyMessage);
+}
+
+message OrderRequestMessage {
+  string id = 1;
+  string customer_id = 2;
+  double value = 3;
+}
+
+message OrderReplyMessage {
+  bool success = 1;
+  string message = 2;
+}

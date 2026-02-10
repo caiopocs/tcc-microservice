@@ -1,0 +1,36 @@
+# .NET
+bin/
+obj/
+publish/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# NuGet
+**/packages/
+*.nupkg
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Visual Studio
+.vs/
+*.csproj.user
+launchSettings.json
+
+# JetBrains Rider
+.idea/
+*.sln.iml
+
+# JMeter results
+results/
+
+# Docker
+**/docker-compose.override.yml
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
