@@ -23,9 +23,6 @@ launchSettings.json
 .idea/
 *.sln.iml
 
-# JMeter results
-results/
-
 # Docker
 **/docker-compose.override.yml
 
